@@ -3,6 +3,7 @@ module github.com/shff/download_full_page
 go 1.23.4
 
 require (
+	github.com/kolesa-team/go-webp v1.0.4
 	github.com/playwright-community/playwright-go v0.4901.0
 	github.com/yosssi/gohtml v0.0.0-20201013000340-ee4748c638f4
 )

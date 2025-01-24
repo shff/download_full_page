@@ -1,17 +1,28 @@
 package main
 
 import (
+	"bytes"
+	"crypto/md5"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
+	"image/png"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 
+	"github.com/kolesa-team/go-webp/encoder"
+	"github.com/kolesa-team/go-webp/webp"
 	"github.com/playwright-community/playwright-go"
 	"github.com/yosssi/gohtml"
 )
+
+var inlineThreshold = 64
+var debug = true
 
 func main() {
 	rawURL := "https://www.letsjive.io/"
@@ -30,6 +41,8 @@ func main() {
 }
 
 func downloadPage(url string, pageDir string) error {
+	debugDir := pageDir + "_debug"
+
 	// Install Playwright
 	err := playwright.Install()
 	if err != nil {
@@ -72,16 +85,25 @@ func downloadPage(url string, pageDir string) error {
 		return fmt.Errorf("could not create directory %s: %v", pageDir, err)
 	}
 
-	// Take a screenshot of the full page
-	err = takeScreenshot(filepath.Join(pageDir, "screenshot1.png"), page)
-	if err != nil {
-		return fmt.Errorf("could not take screenshot: %v", err)
+	if debug {
+		// Create a directory for the page
+		if err := os.MkdirAll(debugDir, 0755); err != nil {
+			return fmt.Errorf("could not create directory %s: %v", pageDir, err)
+		}
+
+		// Take a screenshot of the full page
+		err = takeScreenshot(filepath.Join(debugDir, "screenshot1.png"), page)
+		if err != nil {
+			return fmt.Errorf("could not take screenshot: %v", err)
+		}
 	}
 
 	// Delete junk elements
 	junkElements := []string{
 		"onetrust",
 		"cookie",
+		"Cookie",
+		"intercom",
 	}
 	for _, selector := range junkElements {
 		// delete anything where the ID or class contains the selector
@@ -101,10 +123,12 @@ func downloadPage(url string, pageDir string) error {
 		return fmt.Errorf("could not remove JavaScript: %v", err)
 	}
 
-	// Take a screenshot of the full page
-	err = takeScreenshot(filepath.Join(pageDir, "screenshot2_nojs.png"), page)
-	if err != nil {
-		return fmt.Errorf("could not take screenshot: %v", err)
+	if debug {
+		// Take a screenshot of the full page
+		err = takeScreenshot(filepath.Join(debugDir, "screenshot2_nojs.png"), page)
+		if err != nil {
+			return fmt.Errorf("could not take screenshot: %v", err)
+		}
 	}
 
 	// Delete invisible elements
@@ -121,10 +145,12 @@ func downloadPage(url string, pageDir string) error {
 		return fmt.Errorf("could not delete invisible elements: %v", err)
 	}
 
-	// Take a screenshot of the full page
-	err = takeScreenshot(filepath.Join(pageDir, "screenshot3_no_invisible.png"), page)
-	if err != nil {
-		return fmt.Errorf("could not take screenshot: %v", err)
+	if debug {
+		// Take a screenshot of the full page
+		err = takeScreenshot(filepath.Join(debugDir, "screenshot3_no_invisible.png"), page)
+		if err != nil {
+			return fmt.Errorf("could not take screenshot: %v", err)
+		}
 	}
 
 	// Make sticky elements non-sticky
@@ -132,7 +158,7 @@ func downloadPage(url string, pageDir string) error {
 	_, err = page.Evaluate(`
 		document.querySelectorAll("*").forEach(e => {
 			const style = getComputedStyle(e);
-			if (style.position === "sticky") {
+			if (style.position === "sticky" || style.position === "fixed") {
 				e.style.position = "static";
 			}
 		});
@@ -168,10 +194,84 @@ func downloadPage(url string, pageDir string) error {
 		return fmt.Errorf("could not wait for network idle: %v", err)
 	}
 
-	// Take a screenshot of the full page
-	err = takeScreenshot(filepath.Join(pageDir, "screenshot4_inline_css.png"), page)
+	if debug {
+		// Take a screenshot of the full page
+		err = takeScreenshot(filepath.Join(debugDir, "screenshot4_inline_css.png"), page)
+		if err != nil {
+			return fmt.Errorf("could not take screenshot: %v", err)
+		}
+	}
+
+	//
+	// CSS Cleanup
+	//
+
+	// Delete unused CSS rules
+	_, err = page.Evaluate(`
+		(function() {
+			const usedStyles = new Set();
+			const unusedStyles = new Set();
+
+			[...document.styleSheets].forEach(sheet => {
+				for (let i = 0; i < sheet.cssRules.length; i++) {
+					const rule = sheet.cssRules[i];
+					let selector = rule.selectorText;
+					if (!rule.conditionText) {
+						selector = selector?.replace(/::?(before|after)+/g, '');
+						try {
+							if (!!document.querySelector(selector)) {
+								usedStyles.add(rule);
+							}
+						} catch (e) {
+							usedStyles.add(rule);
+						}
+					} else {
+						if (window.matchMedia(rule.conditionText).matches) {
+							for (let j = 0; j < rule.cssRules.length; j++) {
+								const subRule = rule.cssRules[j];
+								const subSelector = subRule.selectorText;
+
+								if (!!document.querySelector(subSelector)) {
+									usedStyles.add(subRule);
+								}
+							}
+						}
+					}
+				}
+			});
+
+			// Add a style tag with all the used styles
+			const style = document.createElement("style");
+			style.id = "used-styles";
+			style.textContent = [...usedStyles].map(rule => rule.cssText).join("\n");
+			document.head.appendChild(style);
+
+			// Delete all other style tags
+			document.querySelectorAll("style").forEach(s => {
+				if (s.id !== "used-styles" && s.id !== "unused-styles") {
+					s.remove();
+				}
+			});
+		})();
+	`)
 	if err != nil {
-		return fmt.Errorf("could not take screenshot: %v", err)
+		return fmt.Errorf("could not delete unused CSS rules: %v", err)
+	}
+
+	// Wait until the script above has finished
+	err = page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
+		State: playwright.LoadStateNetworkidle,
+	})
+	if err != nil {
+		return fmt.Errorf("could not wait for network idle: %v", err)
+	}
+
+	if debug {
+		// Take a screenshot of the full page
+		err = takeScreenshot(filepath.Join(debugDir, "screenshot6_after_css_cleanup.png"), page)
+		if err != nil {
+			return fmt.Errorf("could not take screenshot: %v", err)
+		}
 	}
 
 	//
@@ -180,20 +280,20 @@ func downloadPage(url string, pageDir string) error {
 
 	// Extract image sources
 	log.Println("Extracting image sources...")
-	imgSrcs, err := page.Evaluate(`Array.from(document.querySelectorAll('img')).map(img => img.src)`)
+	imgImages, err := page.Evaluate(`Array.from(document.querySelectorAll('img')).map(img => img.src)`)
 	if err != nil {
 		return fmt.Errorf("could not extract image sources: %v", err)
 	}
 
 	// Convert result to a slice of strings
-	Imgsrcs, ok := imgSrcs.([]interface{})
+	imgImagesSlice, ok := imgImages.([]interface{})
 	if !ok {
 		return fmt.Errorf("could not convert image sources to strings")
 	}
 
 	// Extract images from CSS background images
 	log.Println("Extracting CSS background images...")
-	cssSrcs, err := page.Evaluate(`
+	cssImages, err := page.Evaluate(`
 		Array.from(document.querySelectorAll("*")).map(e => {
 			const style = getComputedStyle(e);
 			const bg = style.backgroundImage;
@@ -207,17 +307,20 @@ func downloadPage(url string, pageDir string) error {
 	}
 
 	// Convert result to a slice of strings
-	cssSrcsSlice, ok := cssSrcs.([]interface{})
+	cssImagesSlice, ok := cssImages.([]interface{})
 	if !ok {
 		return fmt.Errorf("could not convert CSS background images to strings")
 	}
 
-	srcs := append(Imgsrcs, cssSrcsSlice...)
+	// TODO Handle This!!!
+	// fmt.Println(cssImagesSlice)
+
+	images := append(imgImagesSlice, cssImagesSlice...)
 
 	// Download images
 	log.Println("Downloading images...")
 	imgReplacements := make(map[string]string)
-	for i, src := range srcs {
+	for _, src := range images {
 		imgURL, ok := src.(string)
 		if !ok {
 			continue
@@ -230,11 +333,6 @@ func downloadPage(url string, pageDir string) error {
 			continue
 		}
 
-		baseName := filepath.Base(imgURL)
-		imgName := fmt.Sprintf("image_%d_%s", i, baseName)
-
-		imgReplacements[imgURL] = imgName
-
 		// Get the image
 		resp, err := http.Get(imgURL)
 		if err != nil {
@@ -243,22 +341,166 @@ func downloadPage(url string, pageDir string) error {
 		}
 		defer resp.Body.Close()
 
-		// Save the image locally
-		imgPath := filepath.Join(pageDir, imgName)
-		file, err := os.Create(imgPath)
+		// Get the image into a byte slice
+		imgBytes, err := io.ReadAll(resp.Body)
 		if err != nil {
-			log.Printf("could not create image file %s: %v", imgPath, err)
-			continue
-		}
-		defer file.Close()
-
-		_, err = io.Copy(file, resp.Body)
-		if err != nil {
-			log.Printf("could not save image %s: %v", imgPath, err)
+			log.Printf("could not read image %s: %v", imgURL, err)
 			continue
 		}
 
-		log.Printf("Saved image: %s", imgPath)
+		// Get the md5 hash of the downloaded file
+		hash := md5.Sum(imgBytes)
+		hashString := hex.EncodeToString(hash[:])
+
+		baseName := filepath.Base(imgURL)
+		extension := filepath.Ext(baseName)
+		imgName := fmt.Sprintf("image_%s%s", hashString, extension)
+
+		imgReplacements[imgURL] = imgName
+
+		// Check if the file doesn't exist in the directory yet
+		if _, err := os.Stat(filepath.Join(pageDir, imgName)); err == nil {
+			log.Printf("Image %s already exists, skipping", imgName)
+			continue
+		}
+
+		// Convert PNG images to WebP
+		if extension == ".png" {
+			originalPath := filepath.Join(pageDir, imgName)
+
+			// Decode the input image bytes
+			img, err := png.Decode(bytes.NewReader(imgBytes))
+			if err != nil {
+				log.Printf("could not decode image %s: %v", originalPath, err)
+				continue
+			}
+
+			// Create a buffer to hold the WebP bytes
+			var imageOutput bytes.Buffer
+
+			// Encode the image into WebP format
+			options, err := encoder.NewLossyEncoderOptions(encoder.PresetPicture, 40)
+			if err != nil {
+				log.Fatalln(err)
+			}
+
+			// Encode the image
+			if err := webp.Encode(&imageOutput, img, options); err != nil {
+				log.Fatalln(err)
+			}
+
+			// Use a new name for the WebP image
+			imgName = fmt.Sprintf("image_%s.webp", hashString)
+			imgPath := filepath.Join(pageDir, imgName)
+
+			// Check if file is smaller than 2kb
+			if len(imageOutput.Bytes()) < inlineThreshold {
+				// Create a data: URL for the WebP image
+				webpDataURL := fmt.Sprintf("data:image/webp;base64,%s", base64.StdEncoding.EncodeToString(imageOutput.Bytes()))
+
+				// Replace the image source in the HTML
+				imgReplacements[imgURL] = webpDataURL
+
+				log.Printf("Converted image %s to WebP -- INLINED", imgPath)
+			} else {
+				// Save the image locally
+				file, err := os.Create(imgPath)
+				if err != nil {
+					log.Printf("could not create image file %s: %v", imgPath, err)
+					continue
+				}
+				defer file.Close()
+
+				// Copy the byte buffer
+				_, err = io.Copy(file, &imageOutput)
+				if err != nil {
+					log.Printf("could not write image file %s: %v", imgPath, err)
+					continue
+				}
+
+				// We should replace the image source in the HTML
+				imgReplacements[imgURL] = imgName
+
+				log.Printf("Saved image: %s from %s", imgPath, imgURL)
+			}
+		} else if extension == ".svg" {
+			imgPath := filepath.Join(pageDir, imgName)
+
+			// Save the image locally
+			file, err := os.Create(imgPath)
+			if err != nil {
+				log.Printf("could not create image file %s: %v", imgPath, err)
+				continue
+			}
+			defer file.Close()
+
+			// Copy the byte slice to the file
+			_, err = file.Write(imgBytes)
+			if err != nil {
+				log.Printf("could not write image file %s: %v", imgPath, err)
+				continue
+			}
+
+			originalSize := len(imgBytes)
+
+			// Optimize the SVG image
+			cmd := exec.Command("svgo", "-i", imgPath, "-o", imgPath, "-p", "3")
+			err = cmd.Run()
+			if err != nil {
+				log.Printf("could not optimize SVG image %s: %v", imgPath, err)
+			} else {
+				optimizedBytes, err := os.ReadFile(imgPath)
+				if err != nil {
+					log.Printf("could not read optimized SVG image %s: %v", imgPath, err)
+				} else {
+					optimizedSize := len(optimizedBytes)
+					log.Printf("Optimized SVG image %s: %d -> %d bytes", imgPath, originalSize, optimizedSize)
+				}
+			}
+
+			log.Printf("Saved SVG image: %s from %s", imgPath, imgURL)
+
+			// Read the optimized SVG image
+			imgBytes, err = os.ReadFile(imgPath)
+			if err != nil {
+				log.Printf("could not read optimized SVG image %s: %v", imgPath, err)
+				continue
+			}
+
+			// Check if the image has less than 2kb
+			if len(imgBytes) < inlineThreshold {
+				// Create a data: URL for the SVG image
+				svgDataURL := fmt.Sprintf("data:image/svg+xml;base64,%s", base64.StdEncoding.EncodeToString(imgBytes))
+
+				// Replace the image source in the HTML
+				imgReplacements[imgURL] = svgDataURL
+
+				// Delete the local file
+				err = os.Remove(imgPath)
+				if err != nil {
+					log.Printf("could not delete image file %s: %v", imgPath, err)
+				}
+
+				log.Printf("Optimized SVG image %s -- INLINED", imgPath)
+			}
+		} else {
+			imgPath := filepath.Join(pageDir, imgName)
+
+			// Save the image locally
+			file, err := os.Create(imgPath)
+			if err != nil {
+				log.Printf("could not create image file %s: %v", imgPath, err)
+				continue
+			}
+			defer file.Close()
+
+			// Copy the byte slice to the file
+			_, err = file.Write(imgBytes)
+			if err != nil {
+				log.Printf("could not write image file %s: %v", imgPath, err)
+				continue
+			}
+		}
 	}
 
 	// Replace image sources in the HTML
@@ -281,72 +523,17 @@ func downloadPage(url string, pageDir string) error {
 		return fmt.Errorf("could not wait for network idle: %v", err)
 	}
 
-	// Take a screenshot of the full page
-	err = takeScreenshot(filepath.Join(pageDir, "screenshot5_image_replace.png"), page)
-	if err != nil {
-		return fmt.Errorf("could not take screenshot: %v", err)
+	if debug {
+		// Take a screenshot of the full page
+		err = takeScreenshot(filepath.Join(debugDir, "screenshot6_image_replace.png"), page)
+		if err != nil {
+			return fmt.Errorf("could not take screenshot: %v", err)
+		}
 	}
 
 	//
-	// CSS Cleanup
+	// Extra Cleanup
 	//
-
-	// Delete unused CSS rules
-	_, err = page.Evaluate(`
-		(function() {
-			const usedStyles = new Set();
-			[...document.styleSheets].forEach(sheet => {
-				try {
-					for (let i = 0; i < sheet.cssRules.length; i++) {
-						const rule = sheet.cssRules[i];
-						const selector = rule.selectorText;
-						if (rule.conditionText) {
-							if (window.matchMedia(rule.conditionText).matches) {
-								for (let j = 0; j < rule.cssRules.length; j++) {
-									const subRule = rule.cssRules[j];
-									const subSelector = subRule.selectorText;
-
-									if (!!document.querySelector(subSelector)) {
-										usedStyles.add(subRule);
-									}
-								}
-							}
-						} else {
-							if (!!document.querySelector(selector)) {
-								usedStyles.add(rule);
-							}
-						}
-					}
-				} catch (e) {
-					console.warn("Error processing stylesheet:", e);
-				}
-			});
-
-			// Add a style tag with all the used styles
-			const style = document.createElement("style");
-			style.id = "used-styles";
-			style.textContent = [...usedStyles].map(rule => rule.cssText).join("\n");
-			document.head.appendChild(style);
-
-			// Delete all other style tags
-			document.querySelectorAll("style").forEach(s => {
-				if (s.id !== "used-styles") {
-					s.remove();
-				}
-			});
-		})();
-	`)
-	if err != nil {
-		return fmt.Errorf("could not delete unused CSS rules: %v", err)
-	}
-
-	// Wait until the script above has finished
-	err = page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
-		State: playwright.LoadStateNetworkidle,
-	})
-	if err != nil {
-		return fmt.Errorf("could not wait for network idle: %v", err)
-	}
 
 	// Delete meta tags except http-equiv="Content-Type"
 	log.Println("Deleting meta tags...")
@@ -377,6 +564,60 @@ func downloadPage(url string, pageDir string) error {
 		return fmt.Errorf("could not delete link tags: %v", err)
 	}
 
+	// Delete iframes
+	log.Println("Deleting iframes...")
+	_, err = page.Evaluate(`
+		document.querySelectorAll("iframe").forEach(iframe => iframe.remove());
+	`)
+	if err != nil {
+		return fmt.Errorf("could not delete iframes: %v", err)
+	}
+
+	// Delete attributes starting with data-
+	log.Println("Deleting attributes...")
+	_, err = page.Evaluate(`
+		document.querySelectorAll("*").forEach(e => {
+			for (const attr of e.attributes) {
+				if (attr.name.startsWith("data-")) {
+					e.removeAttribute(attr.name);
+				}
+			}
+		});
+	`)
+	if err != nil {
+		return fmt.Errorf("could not delete data- attributes: %v", err)
+	}
+
+	// Delete all empty class and style tags
+	log.Println("Deleting empty class and style tags...")
+	_, err = page.Evaluate(`
+		document.querySelectorAll("*").forEach(e => {
+			if (e.className === "") {
+				e.removeAttribute("class");
+			}
+			if (e.style.cssText === "") {
+				e.removeAttribute("style");
+			}
+		});
+	`)
+	if err != nil {
+		return fmt.Errorf("could not delete empty class and style tags: %v", err)
+	}
+
+	// Delete title and alt attributes
+	log.Println("Deleting title, alt and aria attributes...")
+	_, err = page.Evaluate(`
+		document.querySelectorAll("*").forEach(e => {
+			e.removeAttribute("title");
+			e.removeAttribute("alt");
+			e.removeAttribute("aria-label");
+			e.removeAttribute("role");
+		});
+	`)
+	if err != nil {
+		return fmt.Errorf("could not delete title, alt and aria attributes: %v", err)
+	}
+
 	// Delete HTML comments
 	log.Println("Deleting HTML comments...")
 	_, err = page.Evaluate(`
@@ -393,19 +634,21 @@ func downloadPage(url string, pageDir string) error {
 		return fmt.Errorf("could not delete HTML comments: %v", err)
 	}
 
-	// Take a screenshot of the full page
-	log.Println("Taking screenshot after...")
-	bytes2, err := page.Screenshot(playwright.PageScreenshotOptions{
-		FullPage: playwright.Bool(true),
-	})
-	if err != nil {
-		return fmt.Errorf("could not take screenshot: %v", err)
-	}
+	if debug {
+		// Take a screenshot of the full page
+		log.Println("Taking screenshot after...")
+		bytes2, err := page.Screenshot(playwright.PageScreenshotOptions{
+			FullPage: playwright.Bool(true),
+		})
+		if err != nil {
+			return fmt.Errorf("could not take screenshot: %v", err)
+		}
 
-	// Save the screenshot to a file
-	log.Println("Saving screenshot after...")
-	if err = os.WriteFile("screenshot2.png", bytes2, 0644); err != nil {
-		return fmt.Errorf("could not save screenshot: %v", err)
+		// Save the screenshot to a file
+		log.Println("Saving screenshot after...")
+		if err = os.WriteFile(filepath.Join(debugDir, "screenshot7_final.png"), bytes2, 0644); err != nil {
+			return fmt.Errorf("could not save screenshot: %v", err)
+		}
 	}
 
 	// Get the full rendered HTML
