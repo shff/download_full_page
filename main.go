@@ -32,8 +32,7 @@ func main() {
 		log.Fatalf("could not parse URL: %v", err)
 	}
 
-	log.Printf("Downloading page: %s - to: %s", rawURL, parsedURL.Host)
-
+	log.Printf("🛜 Processing page: %s - to: %s", rawURL, parsedURL.Host)
 	err = downloadPage(rawURL, parsedURL.Host)
 	if err != nil {
 		log.Fatalf("could not download page: %v", err)
@@ -50,7 +49,7 @@ func downloadPage(url string, pageDir string) error {
 	}
 
 	// Start Playwright
-	log.Println("Starting Playwright...")
+	log.Println("🎬 Starting Playwright...")
 	pw, err := playwright.Run()
 	if err != nil {
 		return fmt.Errorf("could not start Playwright: %v", err)
@@ -58,7 +57,7 @@ func downloadPage(url string, pageDir string) error {
 	defer pw.Stop()
 
 	// Launch a browser
-	log.Println("Launching browser...")
+	log.Println("🚀 Launching browser...")
 	browser, err := pw.Chromium.Launch()
 	if err != nil {
 		return fmt.Errorf("could not launch browser: %v", err)
@@ -72,7 +71,7 @@ func downloadPage(url string, pageDir string) error {
 	}
 
 	// Navigate to the page
-	log.Printf("Navigating to %s...", url)
+	log.Printf("🧭 Navigating to %s...", url)
 	_, err = page.Goto(url, playwright.PageGotoOptions{
 		WaitUntil: playwright.WaitUntilStateNetworkidle,
 	})
@@ -104,6 +103,7 @@ func downloadPage(url string, pageDir string) error {
 		"cookie",
 		"Cookie",
 		"intercom",
+		"ch2-region-c1",
 	}
 	for _, selector := range junkElements {
 		// delete anything where the ID or class contains the selector
@@ -116,15 +116,73 @@ func downloadPage(url string, pageDir string) error {
 		}
 	}
 
+	// Delete iframes
+	log.Println("🖼️ Deleting iframes...")
+	_, err = page.Evaluate(`
+			document.querySelectorAll("iframe").forEach(iframe => iframe.remove());
+		`)
+	if err != nil {
+		return fmt.Errorf("could not delete iframes: %v", err)
+	}
+
+	// Scroll down to the bottom very slowly, then to the top again
+	log.Println("🚶‍♂️ Scrolling down...")
+	_, err = page.Evaluate(`
+		(async function() {
+			for (let i = 0; i < 10; i++) {
+				window.scrollBy(0, window.innerHeight);
+				await new Promise(resolve => setTimeout(resolve, 500));
+			}
+			for (let i = 0; i < 10; i++) {
+				window.scrollBy(0, -window.innerHeight);
+				await new Promise(resolve => setTimeout(resolve, 500));
+			}
+		})();
+	`)
+	if err != nil {
+		return fmt.Errorf("could not scroll down: %v", err)
+	}
+
+	// Wait until the script above has finished
+	err = page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
+		State: playwright.LoadStateNetworkidle,
+	})
+	if err != nil {
+		return fmt.Errorf("could not wait for network idle: %v", err)
+	}
+
+	// Scroll back to the top
+	_, err = page.Evaluate(`window.scrollTo(0, 0)`)
+	if err != nil {
+		return fmt.Errorf("could not scroll to top: %v", err)
+	}
+
+	// Stop javascript from running
+	log.Println("🛑 Stopping JavaScript...")
+	_, err = page.Evaluate(`window.stop()`)
+	if err != nil {
+		return fmt.Errorf("could not stop page: %v", err)
+	}
+
 	// Remove all JavaScript from the page
-	log.Println("Removing JavaScript...")
+	log.Println("🧹 Removing JavaScript...")
 	_, err = page.Evaluate(`document.querySelectorAll("script").forEach(s => s.remove())`)
 	if err != nil {
 		return fmt.Errorf("could not remove JavaScript: %v", err)
 	}
 
+	// Wait until the script above has finished
+	err = page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
+		State:   playwright.LoadStateNetworkidle,
+		Timeout: playwright.Float(2000),
+	})
+	if err != nil {
+		log.Printf("could not wait for network idle: %v\n", err)
+	}
+
 	if debug {
 		// Take a screenshot of the full page
+		log.Println("📸 Taking screenshot after removing JavaScript...")
 		err = takeScreenshot(filepath.Join(debugDir, "screenshot2_nojs.png"), page)
 		if err != nil {
 			return fmt.Errorf("could not take screenshot: %v", err)
@@ -132,10 +190,15 @@ func downloadPage(url string, pageDir string) error {
 	}
 
 	// Delete invisible elements
-	log.Println("Deleting invisible elements...")
+	log.Println("👻 Deleting invisible elements...")
 	_, err = page.Evaluate(`
-		document.querySelectorAll("body *").forEach(e => {
+		document.querySelectorAll("body *:not(link)").forEach(e => {
 			const style = getComputedStyle(e);
+
+			// if it's an SVG that contains symbols linked elsewhere, don't remove it
+			if (e.tagName === "svg" && e.querySelector("symbol")) {
+				return;
+			}
 			if (style.display === "none" || style.visibility === "hidden") {
 				e.remove();
 			}
@@ -147,6 +210,7 @@ func downloadPage(url string, pageDir string) error {
 
 	if debug {
 		// Take a screenshot of the full page
+		log.Println("📸 Taking screenshot after removing invisible elements...")
 		err = takeScreenshot(filepath.Join(debugDir, "screenshot3_no_invisible.png"), page)
 		if err != nil {
 			return fmt.Errorf("could not take screenshot: %v", err)
@@ -154,7 +218,7 @@ func downloadPage(url string, pageDir string) error {
 	}
 
 	// Make sticky elements non-sticky
-	log.Println("Making sticky elements non-sticky...")
+	log.Println("🏒 Making sticky elements non-sticky...")
 	_, err = page.Evaluate(`
 		document.querySelectorAll("*").forEach(e => {
 			const style = getComputedStyle(e);
@@ -168,7 +232,7 @@ func downloadPage(url string, pageDir string) error {
 	}
 
 	// Inline all CSS styles
-	log.Println("Inlining CSS...")
+	log.Println("💅 Inlining CSS...")
 	_, err = page.Evaluate(`
 		(async function() {
 			const styles = document.querySelectorAll("link[rel=stylesheet]");
@@ -196,6 +260,7 @@ func downloadPage(url string, pageDir string) error {
 
 	if debug {
 		// Take a screenshot of the full page
+		log.Println("📸 Taking screenshot after inlining CSS...")
 		err = takeScreenshot(filepath.Join(debugDir, "screenshot4_inline_css.png"), page)
 		if err != nil {
 			return fmt.Errorf("could not take screenshot: %v", err)
@@ -217,9 +282,9 @@ func downloadPage(url string, pageDir string) error {
 					const rule = sheet.cssRules[i];
 					let selector = rule.selectorText;
 					if (!rule.conditionText) {
-						selector = selector?.replace(/::?(before|after)+/g, '');
+						const selectorText = selector?.replace(/::[a-z]+/g, '');
 						try {
-							if (!!document.querySelector(selector)) {
+							if (!!document.querySelector(selectorText)) {
 								usedStyles.add(rule);
 							}
 						} catch (e) {
@@ -230,9 +295,18 @@ func downloadPage(url string, pageDir string) error {
 							for (let j = 0; j < rule.cssRules.length; j++) {
 								const subRule = rule.cssRules[j];
 								const subSelector = subRule.selectorText;
+								const subSelectorText = selector?.replace(/::?[a-z]+/g, '');
 
-								if (!!document.querySelector(subSelector)) {
-									usedStyles.add(subRule);
+								try {
+									if (true || !!document.querySelector(subSelectorText)) {
+										// const mediaRule = new CSSMediaRule();
+										// mediaRule.conditionText = rule.conditionText;
+										// mediaRule.insertRule(subRule.cssText);
+										// usedStyles.add(mediaRule);
+										usedStyles.add(subRule);
+									}
+								} catch (e) {
+								 	usedStyles.add(subRule);
 								}
 							}
 						}
@@ -268,6 +342,7 @@ func downloadPage(url string, pageDir string) error {
 
 	if debug {
 		// Take a screenshot of the full page
+		log.Println("📸 Taking screenshot after CSS cleanup...")
 		err = takeScreenshot(filepath.Join(debugDir, "screenshot6_after_css_cleanup.png"), page)
 		if err != nil {
 			return fmt.Errorf("could not take screenshot: %v", err)
@@ -515,6 +590,16 @@ func downloadPage(url string, pageDir string) error {
 		}
 	}
 
+	// Change the base URL of the page to the local directory
+	_, err = page.Evaluate(fmt.Sprintf(`
+		const base = document.createElement("base");
+		base.href = "%s";
+		document.head.appendChild(base);
+	`, pageDir))
+	if err != nil {
+		return fmt.Errorf("could not change base URL: %v", err)
+	}
+
 	// Wait until the script above has finished
 	err = page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
 		State: playwright.LoadStateNetworkidle,
@@ -525,6 +610,7 @@ func downloadPage(url string, pageDir string) error {
 
 	if debug {
 		// Take a screenshot of the full page
+		log.Println("📸 Taking screenshot after replacing images...")
 		err = takeScreenshot(filepath.Join(debugDir, "screenshot6_image_replace.png"), page)
 		if err != nil {
 			return fmt.Errorf("could not take screenshot: %v", err)
@@ -536,7 +622,7 @@ func downloadPage(url string, pageDir string) error {
 	//
 
 	// Delete meta tags except http-equiv="Content-Type"
-	log.Println("Deleting meta tags...")
+	log.Println("💽 Deleting meta tags...")
 	_, err = page.Evaluate(`
 		document.querySelectorAll("meta").forEach(meta => {
 			if (meta.getAttribute("http-equiv") !== "Content-Type") {
@@ -555,8 +641,17 @@ func downloadPage(url string, pageDir string) error {
 		return fmt.Errorf("could not delete meta tags: %v", err)
 	}
 
+	if debug {
+		// Take a screenshot of the full page
+		log.Println("📸 Taking screenshot after deleting extraneous elements...")
+		err = takeScreenshot(filepath.Join(debugDir, "screenshot7_final_1.png"), page)
+		if err != nil {
+			return fmt.Errorf("could not take screenshot: %v", err)
+		}
+	}
+
 	// Delete link tags
-	log.Println("Deleting link tags...")
+	log.Println("⛓️‍💥 Deleting link tags...")
 	_, err = page.Evaluate(`
 		document.querySelectorAll("link").forEach(link => link.remove());
 	`)
@@ -564,17 +659,17 @@ func downloadPage(url string, pageDir string) error {
 		return fmt.Errorf("could not delete link tags: %v", err)
 	}
 
-	// Delete iframes
-	log.Println("Deleting iframes...")
-	_, err = page.Evaluate(`
-		document.querySelectorAll("iframe").forEach(iframe => iframe.remove());
-	`)
-	if err != nil {
-		return fmt.Errorf("could not delete iframes: %v", err)
+	if debug {
+		// Take a screenshot of the full page
+		log.Println("📸 Taking screenshot after deleting extraneous elements...")
+		err = takeScreenshot(filepath.Join(debugDir, "screenshot7_final_2.png"), page)
+		if err != nil {
+			return fmt.Errorf("could not take screenshot: %v", err)
+		}
 	}
 
 	// Delete attributes starting with data-
-	log.Println("Deleting attributes...")
+	log.Println("✍🏻 Deleting attributes...")
 	_, err = page.Evaluate(`
 		document.querySelectorAll("*").forEach(e => {
 			for (const attr of e.attributes) {
@@ -588,8 +683,17 @@ func downloadPage(url string, pageDir string) error {
 		return fmt.Errorf("could not delete data- attributes: %v", err)
 	}
 
+	if debug {
+		// Take a screenshot of the full page
+		log.Println("📸 Taking screenshot after deleting data attributes...")
+		err = takeScreenshot(filepath.Join(debugDir, "screenshot7_final_3.png"), page)
+		if err != nil {
+			return fmt.Errorf("could not take screenshot: %v", err)
+		}
+	}
+
 	// Delete all empty class and style tags
-	log.Println("Deleting empty class and style tags...")
+	log.Println("🫥 Deleting empty class and style tags...")
 	_, err = page.Evaluate(`
 		document.querySelectorAll("*").forEach(e => {
 			if (e.className === "") {
@@ -604,22 +708,47 @@ func downloadPage(url string, pageDir string) error {
 		return fmt.Errorf("could not delete empty class and style tags: %v", err)
 	}
 
+	if debug {
+		// Take a screenshot of the full page
+		log.Println("📸 Taking screenshot after deleting empty class/style...")
+		err = takeScreenshot(filepath.Join(debugDir, "screenshot7_final_4.png"), page)
+		if err != nil {
+			return fmt.Errorf("could not take screenshot: %v", err)
+		}
+	}
+
 	// Delete title and alt attributes
-	log.Println("Deleting title, alt and aria attributes...")
+	log.Println("♿️ Deleting title, alt and aria attributes...")
 	_, err = page.Evaluate(`
 		document.querySelectorAll("*").forEach(e => {
-			e.removeAttribute("title");
-			e.removeAttribute("alt");
-			e.removeAttribute("aria-label");
-			e.removeAttribute("role");
+			const attrs = e.getAttributeNames();
+			for (const attr of attrs) {
+				if (attr.startsWith("aria-")) {
+					// e.removeAttribute(attr);
+				}
+			}
+			// e.removeAttribute("title");
+			// e.removeAttribute("alt");
+			// e.removeAttribute("role");
+			// e.removeAttribute("itemscope");
+			// e.removeAttribute("itemtype");
 		});
 	`)
 	if err != nil {
 		return fmt.Errorf("could not delete title, alt and aria attributes: %v", err)
 	}
 
+	if debug {
+		// Take a screenshot of the full page
+		log.Println("📸 Taking screenshot after deleting aria...")
+		err = takeScreenshot(filepath.Join(debugDir, "screenshot7_final_5.png"), page)
+		if err != nil {
+			return fmt.Errorf("could not take screenshot: %v", err)
+		}
+	}
+
 	// Delete HTML comments
-	log.Println("Deleting HTML comments...")
+	log.Println("💬 Deleting HTML comments...")
 	_, err = page.Evaluate(`
 		const iterator = document.createNodeIterator(
 			document,
@@ -636,18 +765,10 @@ func downloadPage(url string, pageDir string) error {
 
 	if debug {
 		// Take a screenshot of the full page
-		log.Println("Taking screenshot after...")
-		bytes2, err := page.Screenshot(playwright.PageScreenshotOptions{
-			FullPage: playwright.Bool(true),
-		})
+		log.Println("📸 Taking screenshot after deleting comments...")
+		err = takeScreenshot(filepath.Join(debugDir, "screenshot7_final_6.png"), page)
 		if err != nil {
 			return fmt.Errorf("could not take screenshot: %v", err)
-		}
-
-		// Save the screenshot to a file
-		log.Println("Saving screenshot after...")
-		if err = os.WriteFile(filepath.Join(debugDir, "screenshot7_final.png"), bytes2, 0644); err != nil {
-			return fmt.Errorf("could not save screenshot: %v", err)
 		}
 	}
 
@@ -661,8 +782,36 @@ func downloadPage(url string, pageDir string) error {
 	newHtml := gohtml.Format(html)
 
 	// Save the HTML to a file
+	log.Println("💾 Saving HTML...")
 	if err = os.WriteFile(filepath.Join(pageDir, "index.html"), []byte(newHtml), 0644); err != nil {
 		return fmt.Errorf("could not save HTML: %v", err)
+	}
+
+	if debug {
+		absolutePath, err := filepath.Abs(filepath.Join(pageDir, "index.html"))
+
+		// Open the page in the browser
+		log.Println("🌐 Opening page in playwright...")
+		_, err = page.Goto("file://" + absolutePath)
+		if err != nil {
+			return fmt.Errorf("could not open page in playwright: %v", err)
+		}
+
+		// Wait for the page to load
+		err = page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
+			State:   playwright.LoadStateNetworkidle,
+			Timeout: playwright.Float(2000),
+		})
+		if err != nil {
+			return fmt.Errorf("could not wait for network idle: %v", err)
+		}
+
+		// Take a screenshot of the full page
+		log.Println("📸 Taking screenshot of final page...")
+		err = takeScreenshot(filepath.Join(debugDir, "screenshot8_final_page.png"), page)
+		if err != nil {
+			return fmt.Errorf("could not take screenshot: %v", err)
+		}
 	}
 
 	return nil
@@ -670,16 +819,15 @@ func downloadPage(url string, pageDir string) error {
 
 func takeScreenshot(name string, page playwright.Page) error {
 	// Take a screenshot of the full page
-	log.Println("Taking screenshot...")
 	bytes, err := page.Screenshot(playwright.PageScreenshotOptions{
 		FullPage: playwright.Bool(true),
+		Timeout:  playwright.Float(2000),
 	})
 	if err != nil {
 		return fmt.Errorf("could not take screenshot: %v", err)
 	}
 
 	// Save the screenshot to a file
-	log.Println("Saving screenshot...")
 	if err = os.WriteFile(name, bytes, 0644); err != nil {
 		return fmt.Errorf("could not save screenshot: %v", err)
 	}
