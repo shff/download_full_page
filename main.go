@@ -306,6 +306,82 @@ func downloadPage(url string, pageDir string) error {
 	}
 
 	//
+	// Remove Overlays (cookie banners, consent walls, chat widgets, sticky CTAs)
+	//
+
+	if removeOverlays {
+		log.Println("🍪 Removing overlays...")
+		result, err := page.Evaluate(`
+			(function() {
+				const vw = window.innerWidth;
+				const vh = window.innerHeight;
+
+				// Consent / widget vocabulary, kept specific to avoid matching an
+				// article that merely discusses cookies.
+				const keywords = [
+					"accept cookies", "accept all", "reject all", "cookie policy",
+					"cookie settings", "cookie preferences", "manage cookies",
+					"we value your privacy", "we use cookies", "this site uses cookies",
+					"privacy preferences", "manage preferences", "consent",
+					"gdpr", "ccpa", "your privacy choices",
+				];
+				const keywordRe = new RegExp(keywords.map(k =>
+					k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+				).join("|"), "i");
+
+				let removed = 0;
+				document.querySelectorAll("body *").forEach(e => {
+					if (!e.isConnected) return; // parent already removed
+					const style = getComputedStyle(e);
+					if (style.position !== "fixed" && style.position !== "sticky") {
+						return;
+					}
+
+					const rect = e.getBoundingClientRect();
+					if (rect.width === 0 || rect.height === 0) return;
+
+					// Don't remove the real content: something covering most of the
+					// page AND holding most of its text.
+					const coversPage = rect.width * rect.height > vw * vh * 0.6;
+					const bodyTextLen = document.body.innerText.length || 1;
+					const holdsContent = (e.innerText || "").length > bodyTextLen * 0.5;
+					if (coversPage && holdsContent) return;
+
+					const z = parseInt(style.zIndex, 10) || 0;
+					const edge =
+						rect.bottom >= vh - 4 ||
+						rect.top <= 4 ||
+						rect.right >= vw - 4 ||
+						rect.left <= 4;
+
+					const looksLikeOverlay = edge && z >= 1000;
+					const hasConsentText = keywordRe.test(e.innerText || "") ||
+						keywordRe.test(e.className || "") ||
+						keywordRe.test(e.id || "");
+
+					if (looksLikeOverlay || hasConsentText) {
+						e.remove();
+						removed++;
+					}
+				});
+
+				return removed;
+			})();
+		`)
+		if err != nil {
+			return fmt.Errorf("could not remove overlays: %v", err)
+		}
+		log.Printf("   removed %v overlay element(s)", result)
+
+		if debug {
+			err = takeScreenshot(filepath.Join(debugDir, "screenshot3a_no_overlays.png"), page)
+			if err != nil {
+				return fmt.Errorf("could not take screenshot: %v", err)
+			}
+		}
+	}
+
+	//
 	// Make Elements Non-Sticky
 	//
 
