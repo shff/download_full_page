@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"image/png"
 	"io"
@@ -14,21 +15,21 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
-	"github.com/kolesa-team/go-webp/encoder"
-	"github.com/kolesa-team/go-webp/webp"
-	"github.com/playwright-community/playwright-go"
+	"github.com/HugoSmits86/nativewebp"
+	"github.com/mxschmitt/playwright-go"
 	"github.com/yosssi/gohtml"
 )
 
-var inlineThreshold = 64
+var inlineThreshold = 2048
 var debug = true
 
 func main() {
-	rawURL := os.Args[1]
-	if rawURL == "" {
-		log.Fatalf("no URL provided")
+	if len(os.Args) < 2 || os.Args[1] == "" {
+		log.Fatalf("usage: %s <url>", os.Args[0])
 	}
+	rawURL := os.Args[1]
 
 	parsedURL, err := url.Parse(rawURL)
 	if err != nil {
@@ -51,7 +52,8 @@ func downloadPage(url string, pageDir string) error {
 	deleteIframes := true
 	removeJavascript := true
 	deleteInvisibleElements := true
-	makeElementsNonSticky := true
+	removeOverlays := true
+	makeElementsNonSticky := false
 	inlineCSS := true
 	cssRuleCleanup := true
 	extractImages := true
@@ -197,7 +199,7 @@ func downloadPage(url string, pageDir string) error {
 		log.Println("🛑 Stopping JavaScript...")
 		_, err = page.Evaluate(`
 			window.stop();
-			
+
 			// Stop all timers
 			for (const id of setTimeout(() => {}).toString().match(/\d+/g)) {
 				clearTimeout(id);
@@ -244,7 +246,7 @@ func downloadPage(url string, pageDir string) error {
 			const head = document.head.outerHTML;
 			document.head.innerHTML = "";
 			document.head.innerHTML = head;
-		
+
 			const html = document.documentElement.outerHTML;
 			document.documentElement.innerHTML = "";
 			document.documentElement.innerHTML = html;
@@ -321,6 +323,14 @@ func downloadPage(url string, pageDir string) error {
 		if err != nil {
 			return fmt.Errorf("could not make sticky elements non-sticky: %v", err)
 		}
+
+		if debug {
+			// Take a screenshot of the full page
+			err = takeScreenshot(filepath.Join(debugDir, "screenshot3b_remove_sticky.png"), page)
+			if err != nil {
+				return fmt.Errorf("could not take screenshot: %v", err)
+			}
+		}
 	}
 
 	//
@@ -379,7 +389,7 @@ func downloadPage(url string, pageDir string) error {
 					for (let i = 0; i < sheet.cssRules.length; i++) {
 						const rule = sheet.cssRules[i];
 						let selector = rule.selectorText;
-						
+
 						// Delete white-space pre/prewrap
 						if (rule.style?.whiteSpace === "pre-wrap" || rule.style?.whiteSpace === "pre") {
 							rule.style.removeProperty("white-space");
@@ -399,11 +409,11 @@ func downloadPage(url string, pageDir string) error {
 								for (let j = 0; j < rule.cssRules.length; j++) {
 									const subRule = rule.cssRules[j];
 									const subSelector = subRule.selectorText;
-									const subSelectorText = selector?.replace(/::?[a-z]+/g, '');
+									const subSelectorText = subSelector?.replace(/::?[a-z]+/g, '');
 
 									// Delete white-space pre/prewrap
-									if (rule.style?.whiteSpace === "pre-wrap" || rule.style?.whiteSpace === "pre") {
-										rule.style.removeProperty("white-space");
+									if (subRule.style?.whiteSpace === "pre-wrap" || subRule.style?.whiteSpace === "pre") {
+										subRule.style.removeProperty("white-space");
 									}
 
 									try {
@@ -511,7 +521,7 @@ func downloadPage(url string, pageDir string) error {
 			if imgURL == "" {
 				continue
 			}
-			if imgURL[:5] == "data:" {
+			if strings.HasPrefix(imgURL, "data:") {
 				continue
 			}
 
@@ -521,10 +531,10 @@ func downloadPage(url string, pageDir string) error {
 				// log.Printf("could not get image %s: %v", imgURL, err)
 				continue
 			}
-			defer resp.Body.Close()
 
 			// Get the image into a byte slice
 			imgBytes, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
 			if err != nil {
 				log.Printf("could not read image %s: %v", imgURL, err)
 				continue
@@ -559,15 +569,12 @@ func downloadPage(url string, pageDir string) error {
 				// Create a buffer to hold the WebP bytes
 				var imageOutput bytes.Buffer
 
-				// Encode the image into WebP format
-				options, err := encoder.NewLossyEncoderOptions(encoder.PresetPicture, 40)
-				if err != nil {
-					log.Fatalln(err)
-				}
-
-				// Encode the image
-				if err := webp.Encode(&imageOutput, img, options); err != nil {
-					log.Fatalln(err)
+				// Encode the image into WebP format (lossless VP8L)
+				if err := nativewebp.Encode(&imageOutput, img, &nativewebp.Options{
+					CompressionLevel: nativewebp.DefaultCompression,
+				}); err != nil {
+					log.Printf("could not encode image %s to WebP: %v", imgName, err)
+					continue
 				}
 
 				// Use a new name for the WebP image
@@ -585,16 +592,7 @@ func downloadPage(url string, pageDir string) error {
 					log.Printf("Converted image %s to WebP -- INLINED", imgPath)
 				} else {
 					// Save the image locally
-					file, err := os.Create(imgPath)
-					if err != nil {
-						log.Printf("could not create image file %s: %v", imgPath, err)
-						continue
-					}
-					defer file.Close()
-
-					// Copy the byte buffer
-					_, err = io.Copy(file, &imageOutput)
-					if err != nil {
+					if err := os.WriteFile(imgPath, imageOutput.Bytes(), 0644); err != nil {
 						log.Printf("could not write image file %s: %v", imgPath, err)
 						continue
 					}
@@ -608,16 +606,7 @@ func downloadPage(url string, pageDir string) error {
 				imgPath := filepath.Join(pageDir, imgName)
 
 				// Save the image locally
-				file, err := os.Create(imgPath)
-				if err != nil {
-					log.Printf("could not create image file %s: %v", imgPath, err)
-					continue
-				}
-				defer file.Close()
-
-				// Copy the byte slice to the file
-				_, err = file.Write(imgBytes)
-				if err != nil {
+				if err := os.WriteFile(imgPath, imgBytes, 0644); err != nil {
 					log.Printf("could not write image file %s: %v", imgPath, err)
 					continue
 				}
@@ -668,40 +657,42 @@ func downloadPage(url string, pageDir string) error {
 				imgPath := filepath.Join(pageDir, imgName)
 
 				// Save the image locally
-				file, err := os.Create(imgPath)
-				if err != nil {
-					log.Printf("could not create image file %s: %v", imgPath, err)
-					continue
-				}
-				defer file.Close()
-
-				// Copy the byte slice to the file
-				_, err = file.Write(imgBytes)
-				if err != nil {
+				if err := os.WriteFile(imgPath, imgBytes, 0644); err != nil {
 					log.Printf("could not write image file %s: %v", imgPath, err)
 					continue
 				}
+
+				// Replace the image source in the HTML
+				imgReplacements[imgURL] = imgName
 			}
 		}
 
-		// Replace image sources in the HTML
-		for imgURL, imgName := range imgReplacements {
-			_, err = page.Evaluate(fmt.Sprintf(`
-			document.querySelectorAll('img[src="%s"]').forEach(img => {
-				img.src = "%s";
-			});
-		`, imgURL, imgName))
-			if err != nil {
-				return fmt.Errorf("could not replace image source %s: %v", imgURL, err)
-			}
+		// Replace image sources in the HTML. Match on the browser-resolved
+		// absolute img.src (the map is keyed by absolute URLs), not the raw
+		// attribute, so relatively-referenced images get rewritten too.
+		replacementsJSON, err := json.Marshal(imgReplacements)
+		if err != nil {
+			return fmt.Errorf("could not marshal image replacements: %v", err)
 		}
-
-		// Change the base URL of the page to the local directory
 		_, err = page.Evaluate(fmt.Sprintf(`
+			const replacements = %s;
+			document.querySelectorAll("img").forEach(img => {
+				const local = replacements[img.src];
+				if (local) {
+					img.setAttribute("src", local);
+				}
+			});
+		`, string(replacementsJSON)))
+		if err != nil {
+			return fmt.Errorf("could not replace image sources: %v", err)
+		}
+
+		// Set the base URL so bare local filenames resolve next to index.html
+		_, err = page.Evaluate(`
 			const base = document.createElement("base");
-			base.href = "%s";
+			base.href = "./";
 			document.head.appendChild(base);
-		`, pageDir))
+		`)
 		if err != nil {
 			return fmt.Errorf("could not change base URL: %v", err)
 		}
@@ -884,6 +875,14 @@ func downloadPage(url string, pageDir string) error {
 		}
 	}
 
+	if debug {
+		// Take a screenshot of the full page
+		err = takeScreenshot(filepath.Join(debugDir, "screenshot8_final_original.png"), page)
+		if err != nil {
+			return fmt.Errorf("could not take screenshot: %v", err)
+		}
+	}
+
 	// Get the full rendered HTML
 	html, err := page.Evaluate(`document.documentElement.outerHTML`)
 	if err != nil {
@@ -902,6 +901,9 @@ func downloadPage(url string, pageDir string) error {
 
 	if debug {
 		absolutePath, err := filepath.Abs(filepath.Join(pageDir, "index.html"))
+		if err != nil {
+			return fmt.Errorf("could not resolve absolute path: %v", err)
+		}
 
 		// Open the page in the browser
 		log.Println("🌐 Opening page in playwright...")
@@ -920,7 +922,7 @@ func downloadPage(url string, pageDir string) error {
 		}
 
 		// Take a screenshot of the full page
-		err = takeScreenshot(filepath.Join(debugDir, "screenshot8_final_page.png"), page)
+		err = takeScreenshot(filepath.Join(debugDir, "screenshot9_final_page.png"), page)
 		if err != nil {
 			return fmt.Errorf("could not take screenshot: %v", err)
 		}
