@@ -63,6 +63,7 @@ func downloadPage(url string, pageDir string) error {
 	deleteEmptyStyles := true
 	deleteAria := true
 	deleteComments := true
+	deleteNoscript := true
 
 	// Install Playwright
 	err := playwright.Install()
@@ -369,6 +370,12 @@ func downloadPage(url string, pageDir string) error {
 					}
 				});
 
+				const lockRe = /(^|[\s-])(sp-message-open|modal-open|no-scroll|noscroll|overflow-hidden|scroll-lock|body-lock|cookiewall)/i;
+				[document.documentElement, document.body].forEach(el => {
+					if (!el) return;
+					el.classList.forEach(c => { if (lockRe.test(c)) el.classList.remove(c); });
+				});
+
 				return removed;
 			})();
 		`)
@@ -422,8 +429,8 @@ func downloadPage(url string, pageDir string) error {
 		log.Println("💅 Inlining CSS...")
 		_, err = page.Evaluate(`
 		(function() {
-			// Resolve relative url(...) against the stylesheet's own URL.
 			function absolutizeUrls(cssText, baseHref) {
+				if (!baseHref) return cssText;
 				return cssText.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (m, q, u) => {
 					if (/^(data:|https?:|#)/i.test(u)) return m;
 					try { return 'url("' + new URL(u, baseHref).href + '")'; }
@@ -431,27 +438,33 @@ func downloadPage(url string, pageDir string) error {
 				});
 			}
 
-			const links = [...document.querySelectorAll("link[rel=stylesheet]")];
+			const inlined = [];
 
-			// Fetch all stylesheets first, preserving order and the cascade.
-			return Promise.all(links.map(link =>
-				fetch(link.href)
-					.then(r => r.ok ? r.text() : null)
-					.then(text => ({ link, media: link.media || "", text: text == null ? null : absolutizeUrls(text, link.href) }))
-					.catch(() => ({ link, media: link.media || "", text: null }))
-			)).then(results => {
-				for (const { link, media, text } of results) {
-					// Print-only sheets are inactive on screen but would hide
-					// screen chrome (nav/header) if inlined unconditionally.
-					if (media.trim().toLowerCase() === "print") { link.remove(); continue; }
-					if (text == null) continue; // fetch failed: keep the <link>
-					const tag = document.createElement("style");
-					tag.textContent = (media && media !== "all")
-						? "@media " + media + " {\n" + text + "\n}"
-						: text;
-					link.replaceWith(tag);
+			for (const sheet of document.styleSheets) {
+				const media = sheet.media.mediaText || "";
+				if (sheet.disabled) continue;
+				if (media.trim().toLowerCase() === "print") continue;
+
+				let css = "";
+				try {
+					for (const rule of sheet.cssRules) {
+						css += absolutizeUrls(rule.cssText, sheet.href) + "\n";
+					}
+				} catch (e) {
+					continue;
 				}
-			});
+
+				inlined.push({ media, css });
+			}
+
+			document.querySelectorAll("link[rel=stylesheet], style").forEach(l => l.remove());
+			for (const { media, css } of inlined) {
+				const tag = document.createElement("style");
+				tag.textContent = (media && media !== "all")
+					? "@media " + media + " {\n" + css + "\n}"
+					: css;
+				document.head.appendChild(tag);
+			}
 		})();
 	`)
 		if err != nil {
@@ -645,8 +658,11 @@ func downloadPage(url string, pageDir string) error {
 			hash := md5.Sum(imgBytes)
 			hashString := hex.EncodeToString(hash[:])
 
-			baseName := filepath.Base(imgURL)
-			extension := filepath.Ext(baseName)
+			cleanURL := imgURL
+			if i := strings.IndexAny(cleanURL, "?#"); i != -1 {
+				cleanURL = cleanURL[:i]
+			}
+			extension := strings.ToLower(filepath.Ext(cleanURL))
 			imgName := fmt.Sprintf("image_%s%s", hashString, extension)
 
 			imgReplacements[imgURL] = imgName
@@ -788,6 +804,20 @@ func downloadPage(url string, pageDir string) error {
 			return fmt.Errorf("could not replace image sources: %v", err)
 		}
 
+		// Absolutize links to the original site before adding the local <base>
+		_, err = page.Evaluate(`
+			document.querySelectorAll("a[href]").forEach(a => {
+				const href = a.getAttribute("href");
+				if (href.startsWith("#") || href.startsWith("mailto:") || href.startsWith("tel:")) {
+					return;
+				}
+				a.setAttribute("href", a.href);
+			});
+		`)
+		if err != nil {
+			return fmt.Errorf("could not absolutize links: %v", err)
+		}
+
 		// Set the base URL so bare local filenames resolve next to index.html
 		_, err = page.Evaluate(`
 			const base = document.createElement("base");
@@ -823,18 +853,12 @@ func downloadPage(url string, pageDir string) error {
 		// Delete meta tags except http-equiv="Content-Type"
 		log.Println("💽 Deleting meta tags...")
 		_, err = page.Evaluate(`
-		document.querySelectorAll("meta").forEach(meta => {
-			if (meta.getAttribute("http-equiv") !== "Content-Type") {
-				meta.remove();
-			}
-		});
+		document.querySelectorAll("meta").forEach(meta => meta.remove());
 
-		// If there's no meta charset tag, add one
-		if (!document.querySelector('meta[charset]')) {
-			const meta = document.createElement("meta");
-			meta.setAttribute("charset", "UTF-8");
-			document.head.appendChild(meta);
-		}
+		// charset meta must be within the first 1024 bytes, so prepend it
+		const meta = document.createElement("meta");
+		meta.setAttribute("charset", "UTF-8");
+		document.head.prepend(meta);
 	`)
 		if err != nil {
 			return fmt.Errorf("could not delete meta tags: %v", err)
@@ -869,14 +893,35 @@ func downloadPage(url string, pageDir string) error {
 	}
 
 	if deleteAttributes {
-		// Delete attributes starting with data-
+		// Delete data-* attributes, keeping ones still used by a CSS selector
 		log.Println("✍🏻 Deleting attributes...")
 		_, err = page.Evaluate(`
-		document.querySelectorAll("*").forEach(e => {
-			for (const attr of e.attributes) {
-				if (attr.name.startsWith("data-")) {
-					e.removeAttribute(attr.name);
+		const dataAttrSelectors = new Map();
+		for (const sheet of document.styleSheets) {
+			let rules;
+			try { rules = sheet.cssRules; } catch (e) { continue; }
+			for (const rule of rules) {
+				const sel = rule.selectorText;
+				if (!sel) continue;
+				for (const m of sel.matchAll(/\[\s*(data-[\w-]+)/g)) {
+					const name = m[1].toLowerCase();
+					if (!dataAttrSelectors.has(name)) dataAttrSelectors.set(name, []);
+					dataAttrSelectors.get(name).push(sel);
 				}
+			}
+		}
+
+		document.querySelectorAll("*").forEach(e => {
+			for (const name of e.getAttributeNames()) {
+				if (!name.startsWith("data-")) continue;
+
+				const selectors = dataAttrSelectors.get(name);
+				if (!selectors) { e.removeAttribute(name); continue; }
+
+				const stillUsed = selectors.some(sel => {
+					try { return e.matches(sel); } catch (err) { return true; }
+				});
+				if (!stillUsed) e.removeAttribute(name);
 			}
 		});
 	`)
@@ -973,6 +1018,14 @@ func downloadPage(url string, pageDir string) error {
 			if err != nil {
 				return fmt.Errorf("could not take screenshot: %v", err)
 			}
+		}
+	}
+
+	if deleteNoscript {
+		log.Println("🚫 Deleting noscript tags...")
+		_, err = page.Evaluate(`document.querySelectorAll("noscript").forEach(n => n.remove())`)
+		if err != nil {
+			return fmt.Errorf("could not delete noscript tags: %v", err)
 		}
 	}
 
