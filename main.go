@@ -893,29 +893,38 @@ func downloadPage(url string, pageDir string) error {
 	}
 
 	if deleteAttributes {
-		// Delete data-* attributes, keeping ones still used by a CSS selector
+		// Delete attributes not referenced by CSS and not functionally required
 		log.Println("✍🏻 Deleting attributes...")
 		_, err = page.Evaluate(`
-		const dataAttrSelectors = new Map();
+		// Attributes required for the snapshot to work even though CSS never
+		// selects on them (links, images, structure, styling hooks).
+		const keepAlways = new Set([
+			"class", "id", "style", "href", "src", "srcset", "sizes",
+			"charset", "content", "rel", "type", "media", "width", "height",
+			"viewbox", "d", "fill", "points", "x", "y", "cx", "cy", "r",
+			"transform", "xmlns", "preserveaspectratio",
+		]);
+
+		const attrSelectors = new Map();
 		for (const sheet of document.styleSheets) {
 			let rules;
 			try { rules = sheet.cssRules; } catch (e) { continue; }
 			for (const rule of rules) {
 				const sel = rule.selectorText;
 				if (!sel) continue;
-				for (const m of sel.matchAll(/\[\s*(data-[\w-]+)/g)) {
+				for (const m of sel.matchAll(/\[\s*([\w-]+)/g)) {
 					const name = m[1].toLowerCase();
-					if (!dataAttrSelectors.has(name)) dataAttrSelectors.set(name, []);
-					dataAttrSelectors.get(name).push(sel);
+					if (!attrSelectors.has(name)) attrSelectors.set(name, []);
+					attrSelectors.get(name).push(sel);
 				}
 			}
 		}
 
 		document.querySelectorAll("*").forEach(e => {
 			for (const name of e.getAttributeNames()) {
-				if (!name.startsWith("data-")) continue;
+				if (keepAlways.has(name.toLowerCase())) continue;
 
-				const selectors = dataAttrSelectors.get(name);
+				const selectors = attrSelectors.get(name.toLowerCase());
 				if (!selectors) { e.removeAttribute(name); continue; }
 
 				const stillUsed = selectors.some(sel => {
@@ -926,7 +935,7 @@ func downloadPage(url string, pageDir string) error {
 		});
 	`)
 		if err != nil {
-			return fmt.Errorf("could not delete data- attributes: %v", err)
+			return fmt.Errorf("could not delete attributes: %v", err)
 		}
 
 		if debug {
@@ -1089,7 +1098,7 @@ func takeScreenshot(name string, page playwright.Page) error {
 	// Take a screenshot of the full page
 	bytes, err := page.Screenshot(playwright.PageScreenshotOptions{
 		FullPage: playwright.Bool(true),
-		Timeout:  playwright.Float(2000),
+		Timeout:  playwright.Float(15000),
 	})
 	if err != nil {
 		return fmt.Errorf("could not take screenshot: %v", err)
