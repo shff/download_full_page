@@ -82,6 +82,10 @@ func downloadPage(url string, pageDir string) error {
 	log.Println("🚀 Launching browser...")
 	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
 		Headless: playwright.Bool(headless),
+		Args: []string{
+			"--disable-web-security",
+			"--disable-features=IsolateOrigins,site-per-process",
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("could not launch browser: %v", err)
@@ -417,16 +421,37 @@ func downloadPage(url string, pageDir string) error {
 		// Inline all CSS styles
 		log.Println("💅 Inlining CSS...")
 		_, err = page.Evaluate(`
-		(async function() {
-			const styles = document.querySelectorAll("link[rel=stylesheet]");
-			for (const link of styles) {
-				const style = document.createElement("style");
-				const result = await fetch(link.href);
-				const text = await result.text();
-				const tag = document.createElement("style");
-				tag.textContent = text;
-				link.replaceWith(tag);
+		(function() {
+			// Resolve relative url(...) against the stylesheet's own URL.
+			function absolutizeUrls(cssText, baseHref) {
+				return cssText.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (m, q, u) => {
+					if (/^(data:|https?:|#)/i.test(u)) return m;
+					try { return 'url("' + new URL(u, baseHref).href + '")'; }
+					catch (e) { return m; }
+				});
 			}
+
+			const links = [...document.querySelectorAll("link[rel=stylesheet]")];
+
+			// Fetch all stylesheets first, preserving order and the cascade.
+			return Promise.all(links.map(link =>
+				fetch(link.href)
+					.then(r => r.ok ? r.text() : null)
+					.then(text => ({ link, media: link.media || "", text: text == null ? null : absolutizeUrls(text, link.href) }))
+					.catch(() => ({ link, media: link.media || "", text: null }))
+			)).then(results => {
+				for (const { link, media, text } of results) {
+					// Print-only sheets are inactive on screen but would hide
+					// screen chrome (nav/header) if inlined unconditionally.
+					if (media.trim().toLowerCase() === "print") { link.remove(); continue; }
+					if (text == null) continue; // fetch failed: keep the <link>
+					const tag = document.createElement("style");
+					tag.textContent = (media && media !== "all")
+						? "@media " + media + " {\n" + text + "\n}"
+						: text;
+					link.replaceWith(tag);
+				}
+			});
 		})();
 	`)
 		if err != nil {
